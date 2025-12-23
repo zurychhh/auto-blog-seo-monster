@@ -5,12 +5,16 @@ Schedule API endpoints - manage automatic post scheduling.
 from typing import List, Optional
 from uuid import UUID
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, status
+import logging
+from fastapi import APIRouter, Depends, HTTPException, status, Header, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from croniter import croniter
 
 from app.database import get_db
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 from app.models.schedule import ScheduleConfig, ScheduleInterval
 from app.models.agent import Agent
 from app.models.user import User
@@ -425,3 +429,88 @@ async def toggle_schedule(
     await db.refresh(schedule)
 
     return schedule_to_response(schedule)
+
+
+# ============================================================================
+# CRON TRIGGER ENDPOINT (for external cron services like cron-job.org)
+# ============================================================================
+
+async def run_auto_publish_for_schedule(schedule_id: str):
+    """
+    Run auto-publish workflow for a single schedule.
+    This runs the same logic as the Celery task but synchronously.
+    """
+    from app.tasks.auto_publish_tasks import auto_generate_and_publish
+
+    try:
+        # Run the task synchronously (it uses asyncio.run internally)
+        result = auto_generate_and_publish(schedule_id)
+        logger.info(f"Auto-publish completed for schedule {schedule_id}: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Auto-publish failed for schedule {schedule_id}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/trigger-due", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_due_schedules(
+    background_tasks: BackgroundTasks,
+    x_cron_secret: Optional[str] = Header(None, alias="X-Cron-Secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Trigger all schedules that are due for execution.
+
+    This endpoint is designed to be called by external cron services
+    (e.g., cron-job.org, GitHub Actions) every hour.
+
+    Authentication: X-Cron-Secret header must match CRON_SECRET env variable.
+    If CRON_SECRET is not set, falls back to JWT_SECRET.
+
+    Returns immediately with 202 Accepted, processing happens in background.
+    """
+    # Verify cron secret
+    expected_secret = settings.CRON_SECRET or settings.JWT_SECRET
+    if x_cron_secret != expected_secret:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid cron secret"
+        )
+
+    now = datetime.utcnow()
+
+    # Get all active schedules that are due
+    result = await db.execute(
+        select(ScheduleConfig).where(
+            ScheduleConfig.is_active == True,
+            ScheduleConfig.next_run_at <= now
+        )
+    )
+    due_schedules = result.scalars().all()
+
+    triggered_ids = []
+
+    for schedule in due_schedules:
+        try:
+            # Update next_run_at immediately to prevent double-triggering
+            schedule.next_run_at = calculate_next_run(schedule.get_cron_expression())
+            await db.commit()
+
+            # Add to background tasks
+            background_tasks.add_task(
+                run_auto_publish_for_schedule,
+                str(schedule.id)
+            )
+            triggered_ids.append(str(schedule.id))
+            logger.info(f"Triggered auto-publish for schedule {schedule.id}")
+
+        except Exception as e:
+            logger.error(f"Error triggering schedule {schedule.id}: {e}")
+            continue
+
+    return {
+        "status": "accepted",
+        "message": f"Triggered {len(triggered_ids)} schedule(s)",
+        "triggered_schedules": triggered_ids,
+        "checked_at": now.isoformat(),
+    }

@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     # External APIs
     BRAVE_API_KEY: Optional[str] = None
 
+    # Cron/Scheduler Secret (for external cron services)
+    CRON_SECRET: Optional[str] = None
+
     # Limits (defaults)
     DEFAULT_TOKENS_LIMIT: int = 100000
     DEFAULT_POSTS_LIMIT: int = 50
