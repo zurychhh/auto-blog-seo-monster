@@ -34,6 +34,295 @@ from app.ai.token_counter import get_token_counter
 logger = logging.getLogger(__name__)
 
 
+async def run_auto_publish_workflow(schedule_id: str, db: AsyncSession) -> dict:
+    """
+    Async version of auto-publish workflow for use with FastAPI BackgroundTasks.
+
+    This function can be called directly from async context without Celery.
+
+    Args:
+        schedule_id: Schedule UUID as string
+        db: Async database session
+
+    Returns:
+        dict with result status and post_id
+    """
+    topic_service = get_topic_discovery_service()
+
+    try:
+        # Get schedule
+        result = await db.execute(
+            select(ScheduleConfig).where(ScheduleConfig.id == UUID(schedule_id))
+        )
+        schedule = result.scalar_one_or_none()
+
+        if not schedule:
+            logger.error(f"Schedule {schedule_id} not found")
+            return {"success": False, "error": "Schedule not found"}
+
+        if not schedule.is_active:
+            logger.info(f"Schedule {schedule_id} is inactive")
+            return {"success": False, "error": "Schedule is inactive"}
+
+        # Get agent
+        agent_result = await db.execute(
+            select(Agent).where(Agent.id == schedule.agent_id)
+        )
+        agent = agent_result.scalar_one_or_none()
+
+        if not agent or not agent.is_active:
+            logger.error(f"Agent for schedule {schedule_id} not found or inactive")
+            schedule.failed_posts += 1
+            schedule.last_run_at = datetime.utcnow()
+            await db.commit()
+            return {"success": False, "error": "Agent not found or inactive"}
+
+        logger.info(f"Starting auto-publish for schedule {schedule_id}, agent {agent.name}")
+
+        # ============ PHASE 1: DISCOVERY ============
+        logger.info("Phase 1: Discovering topics...")
+
+        # Get already published titles to avoid duplicates
+        existing_posts = await db.execute(
+            select(Post.title).where(Post.agent_id == agent.id)
+        )
+        existing_titles = [row[0] for row in existing_posts.fetchall()]
+
+        # Map target keywords to categories
+        categories = None
+        if schedule.target_keywords:
+            categories = _map_keywords_to_categories(schedule.target_keywords)
+
+        # Discover topics
+        topics = await topic_service.discover_topics(
+            categories=categories,
+            max_topics=10,
+            exclude_titles=existing_titles,
+        )
+
+        if not topics:
+            logger.warning(f"No topics discovered for schedule {schedule_id}")
+            schedule.failed_posts += 1
+            schedule.last_run_at = datetime.utcnow()
+            await db.commit()
+            return {"success": False, "error": "No trending topics found"}
+
+        # Filter by exclude keywords
+        if schedule.exclude_keywords:
+            topics = _filter_excluded_topics(topics, schedule.exclude_keywords)
+
+        if not topics:
+            logger.warning("All topics filtered out by exclude keywords")
+            schedule.failed_posts += 1
+            schedule.last_run_at = datetime.utcnow()
+            await db.commit()
+            return {"success": False, "error": "All topics filtered out"}
+
+        # Select best topic
+        best_topic = topics[0]
+        logger.info(f"Selected topic: {best_topic.title}")
+
+        # ============ PHASE 2: AI RESEARCH ============
+        logger.info("Phase 2: AI keyword research...")
+
+        claude_client = get_claude_client()
+        best_topic = await topic_service.get_topic_with_ai_suggestions(
+            best_topic, claude_client
+        )
+
+        # ============ PHASE 3: GENERATION ============
+        logger.info("Phase 3: Generating post...")
+
+        post_generator = get_post_generator()
+        seo_service = get_seo_service()
+        token_counter = get_token_counter()
+        usage_service = get_usage_service()
+
+        # Check quotas
+        quota_status = await usage_service.check_tenant_quota(
+            db=db,
+            tenant_id=agent.tenant_id,
+            tokens_needed=5000,
+            posts_needed=1,
+        )
+
+        if not quota_status["tokens_available"] or not quota_status["posts_available"]:
+            logger.warning(f"Quota exceeded for tenant {agent.tenant_id}")
+            schedule.failed_posts += 1
+            schedule.last_run_at = datetime.utcnow()
+            await db.commit()
+            return {"success": False, "error": "Quota exceeded"}
+
+        # Prepare generation parameters
+        topic_title = best_topic.suggested_title or best_topic.title
+        main_keyword = best_topic.suggested_keywords[0] if best_topic.suggested_keywords else best_topic.category
+
+        # Build additional context
+        additional_context = f"""
+ŹRÓDŁO INSPIRACJI: {best_topic.source}
+URL ŹRÓDŁA: {best_topic.source_url}
+DATA PUBLIKACJI ŹRÓDŁA: {best_topic.published_at}
+
+OPIS TEMATU:
+{best_topic.description}
+
+SUGEROWANE PODEJŚCIE:
+{best_topic.suggested_angle or 'Kompleksowe omówienie tematu z praktycznymi wskazówkami'}
+
+DODATKOWE KEYWORDS DO WYKORZYSTANIA:
+{', '.join(best_topic.suggested_keywords) if best_topic.suggested_keywords else main_keyword}
+
+WAŻNE: Stwórz oryginalny artykuł inspirowany powyższym źródłem, NIE kopiuj treści.
+Dodaj praktyczne wskazówki i przykłady z polskiego prawa.
+"""
+
+        # Generate post
+        generation_result = await post_generator.generate_post(
+            agent=agent,
+            topic=topic_title,
+            keyword=main_keyword,
+            sources_content=additional_context,
+        )
+
+        # ============ PHASE 4: VALIDATION ============
+        logger.info("Phase 4: Validating quality...")
+
+        # Calculate SEO metrics
+        readability_score = seo_service.calculate_readability_score(
+            generation_result["content"]
+        )
+
+        keyword_density = {}
+        if generation_result["keywords"]:
+            keyword_density = seo_service.calculate_keyword_density(
+                generation_result["content"],
+                generation_result["keywords"]
+            )
+
+        # Calculate overall SEO score
+        seo_score = _calculate_seo_score(
+            content=generation_result["content"],
+            title=generation_result["title"],
+            meta_description=generation_result["meta_description"],
+            keyword=main_keyword,
+            readability=readability_score,
+            keyword_density=keyword_density,
+        )
+
+        logger.info(f"SEO Score: {seo_score}/100, Readability: {readability_score}")
+
+        # Generate slug
+        slug = seo_service.generate_slug(generation_result["title"])
+
+        # ============ PHASE 5: PUBLISH ============
+        logger.info("Phase 5: Publishing post...")
+
+        # Determine status based on settings and quality
+        seo_threshold = 30
+        status = "published" if schedule.auto_publish and seo_score >= seo_threshold else "draft"
+
+        if seo_score < seo_threshold:
+            logger.warning(f"SEO score too low ({seo_score}), saving as draft")
+
+        # Create post
+        new_post = Post(
+            agent_id=agent.id,
+            title=generation_result["title"],
+            content=generation_result["content"],
+            meta_title=generation_result["meta_title"],
+            meta_description=generation_result["meta_description"],
+            keywords=generation_result["keywords"],
+            slug=slug,
+            status=status,
+            published_at=datetime.utcnow() if status == "published" else None,
+            tokens_used=generation_result["tokens_used"],
+            word_count=generation_result["word_count"],
+            readability_score=readability_score,
+            keyword_density=keyword_density,
+            source_urls=[best_topic.source_url] if best_topic.source_url else [],
+        )
+
+        db.add(new_post)
+        await db.flush()
+
+        # Log usage
+        cost = token_counter.estimate_cost(
+            input_tokens=generation_result["tokens_used"] // 2,
+            output_tokens=generation_result["tokens_used"] // 2,
+        )
+
+        await usage_service.log_usage(
+            db=db,
+            tenant_id=agent.tenant_id,
+            action_type="auto_publish_generation",
+            tokens_used=generation_result["tokens_used"],
+            cost=cost,
+            agent_id=agent.id,
+            meta_data={
+                "post_id": str(new_post.id),
+                "schedule_id": schedule_id,
+                "topic_source": best_topic.source,
+                "seo_score": seo_score,
+                "auto_published": status == "published",
+            },
+        )
+
+        # Update tenant usage
+        await usage_service.update_tenant_usage(
+            db=db,
+            tenant_id=agent.tenant_id,
+            tokens_delta=generation_result["tokens_used"],
+            posts_delta=1,
+        )
+
+        # Update schedule stats
+        schedule.last_run_at = datetime.utcnow()
+        schedule.total_posts_generated += 1
+        if status == "published":
+            schedule.successful_posts += 1
+
+        # Calculate next run
+        cron = croniter(schedule.get_cron_expression(), datetime.utcnow())
+        schedule.next_run_at = cron.get_next(datetime)
+
+        await db.commit()
+        await db.refresh(new_post)
+
+        logger.info(f"Successfully created post {new_post.id} ({status})")
+
+        return {
+            "success": True,
+            "post_id": str(new_post.id),
+            "title": new_post.title,
+            "status": status,
+            "seo_score": seo_score,
+            "word_count": new_post.word_count,
+            "topic_source": best_topic.source,
+        }
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error in auto-publish for schedule {schedule_id}: {e}", exc_info=True)
+
+        # Update failed count
+        try:
+            result = await db.execute(
+                select(ScheduleConfig).where(ScheduleConfig.id == UUID(schedule_id))
+            )
+            schedule = result.scalar_one_or_none()
+            if schedule:
+                schedule.failed_posts += 1
+                schedule.last_run_at = datetime.utcnow()
+                await db.commit()
+        except Exception:
+            pass
+
+        return {"success": False, "error": str(e)}
+
+    finally:
+        await topic_service.close()
+
+
 def get_task_db_session():
     """Create a fresh database session for Celery tasks.
 
