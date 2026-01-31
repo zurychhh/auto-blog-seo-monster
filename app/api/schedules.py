@@ -71,13 +71,18 @@ async def create_schedule(
     current_user: User = Depends(get_current_user),
 ):
     """Create a new automatic post schedule."""
-    # Verify agent exists and belongs to user's tenant
-    result = await db.execute(
-        select(Agent).where(
-            Agent.id == schedule_data.agent_id,
-            Agent.tenant_id == current_user.tenant_id,
+    # Verify agent exists and belongs to user's tenant (superadmin can access all)
+    if current_user.is_superadmin():
+        result = await db.execute(
+            select(Agent).where(Agent.id == schedule_data.agent_id)
         )
-    )
+    else:
+        result = await db.execute(
+            select(Agent).where(
+                Agent.id == schedule_data.agent_id,
+                Agent.tenant_id == current_user.tenant_id,
+            )
+        )
     agent = result.scalar_one_or_none()
 
     if not agent:
@@ -124,11 +129,14 @@ async def list_schedules(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List all schedules for current tenant."""
-    # Get agents for this tenant
-    agents_result = await db.execute(
-        select(Agent.id).where(Agent.tenant_id == current_user.tenant_id)
-    )
+    """List all schedules for current tenant (or all for superadmin)."""
+    # Get agents - superadmin sees all, regular users see their tenant's
+    if current_user.is_superadmin():
+        agents_result = await db.execute(select(Agent.id))
+    else:
+        agents_result = await db.execute(
+            select(Agent.id).where(Agent.tenant_id == current_user.tenant_id)
+        )
     agent_ids = [row[0] for row in agents_result.fetchall()]
 
     if not agent_ids:
@@ -153,11 +161,14 @@ async def get_schedule_stats(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Get schedule statistics for current tenant."""
-    # Get agents for this tenant
-    agents_result = await db.execute(
-        select(Agent.id, Agent.name).where(Agent.tenant_id == current_user.tenant_id)
-    )
+    """Get schedule statistics for current tenant (or all for superadmin)."""
+    # Get agents - superadmin sees all
+    if current_user.is_superadmin():
+        agents_result = await db.execute(select(Agent.id, Agent.name))
+    else:
+        agents_result = await db.execute(
+            select(Agent.id, Agent.name).where(Agent.tenant_id == current_user.tenant_id)
+        )
     agents = {row[0]: row[1] for row in agents_result.fetchall()}
     agent_ids = list(agents.keys())
 

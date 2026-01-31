@@ -102,18 +102,14 @@ async def get_current_superadmin(
 async def get_current_tenant(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
-) -> Tenant:
+) -> Optional[Tenant]:
     """
     Get current user's tenant.
 
-    Raises:
-        HTTPException: 403 if user has no tenant (e.g., superadmin)
+    Returns None for superadmin users (they have no tenant_id).
     """
     if not current_user.tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="No tenant associated with this user",
-        )
+        return None
 
     from sqlalchemy import select
     result = await db.execute(

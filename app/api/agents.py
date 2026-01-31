@@ -2,7 +2,7 @@
 Agents API endpoints - CRUD operations for AI agents.
 """
 
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,10 +24,9 @@ async def list_agents(
     limit: int = 100,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_current_tenant)
+    tenant: Optional[Tenant] = Depends(get_current_tenant)
 ):
-    """List all agents for current tenant."""
-    # Superadmin can see all agents, regular users see only their tenant's
+    """List all agents for current tenant (or all for superadmin)."""
     if current_user.is_superadmin():
         result = await db.execute(
             select(Agent)
@@ -53,11 +52,14 @@ async def create_agent(
     agent_data: AgentCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    tenant: Tenant = Depends(get_current_tenant)
+    tenant: Optional[Tenant] = Depends(get_current_tenant)
 ):
     """Create new agent."""
-    # Regular users can only create agents in their tenant
-    # Superadmin would need to specify tenant_id (not implemented here for simplicity)
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Superadmin must specify a tenant context to create agents",
+        )
 
     new_agent = Agent(
         tenant_id=tenant.id,
