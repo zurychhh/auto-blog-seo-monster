@@ -30,10 +30,16 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# CORS middleware
+# CORS middleware — merge env config + hardcoded origins
+_extra_origins = [
+    "https://oleksiakconsulting.com",
+    "https://www.oleksiakconsulting.com",
+]
+_all_origins = list(set(settings.CORS_ORIGINS + _extra_origins))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=_all_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -68,9 +74,9 @@ async def startup_event():
             admin = result.scalar_one_or_none()
 
             if admin:
-                logger.info(f"Found admin user: {admin.email}, tenant_id: {admin.tenant_id}")
-
-                if admin.tenant_id is None:
+                logger.info(f"Found admin user: {admin.email}, role: {admin.role}, tenant_id: {admin.tenant_id}")
+                # Don't override if user is already superadmin
+                if admin.role != "superadmin" and admin.tenant_id is None:
                     # Get Legitio tenant
                     result = await db.execute(
                         select(Tenant).where(Tenant.slug == "legitio")
@@ -85,7 +91,7 @@ async def startup_event():
                     else:
                         logger.warning("Legitio tenant not found!")
                 else:
-                    logger.info(f"Admin already has tenant: {admin.tenant_id}")
+                    logger.info(f"Admin already configured: role={admin.role}, tenant={admin.tenant_id}")
             else:
                 logger.info("No admin@legitio.pl user found")
     except Exception as e:
