@@ -4,6 +4,7 @@ For displaying published blog posts on landing pages.
 """
 
 from typing import List, Optional
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -25,14 +26,20 @@ router = APIRouter(prefix="/public", tags=["Public"])
 async def list_public_posts(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    agent_id: Optional[UUID] = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
     """
     List published posts - PUBLIC endpoint (no authentication required).
     Only returns posts with status='published'.
+    Optionally filter by agent_id.
     """
     # Build query for published posts only
     query = select(Post).where(Post.status == "published")
+
+    # Filter by agent_id if provided
+    if agent_id:
+        query = query.where(Post.agent_id == agent_id)
 
     # Get total count
     count_query = select(func.count()).select_from(query.subquery())
@@ -85,20 +92,22 @@ async def get_public_post_by_slug(
 @router.get("/posts/featured", response_model=List[PostResponse])
 async def get_featured_posts(
     limit: int = Query(3, ge=1, le=10),
+    agent_id: Optional[UUID] = Query(None),
     db: AsyncSession = Depends(get_db)
 ):
     """
     Get featured published posts - PUBLIC endpoint.
     Returns the most recent published posts (default: 3).
     Perfect for landing page "Knowledge Base" section.
+    Optionally filter by agent_id.
     """
     order_column = func.coalesce(Post.published_at, Post.created_at)
-    query = (
-        select(Post)
-        .where(Post.status == "published")
-        .order_by(order_column.desc())
-        .limit(limit)
-    )
+    query = select(Post).where(Post.status == "published")
+
+    if agent_id:
+        query = query.where(Post.agent_id == agent_id)
+
+    query = query.order_by(order_column.desc()).limit(limit)
 
     result = await db.execute(query)
     posts = result.scalars().all()
