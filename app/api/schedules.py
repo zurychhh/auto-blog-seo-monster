@@ -5,7 +5,6 @@ Schedule API endpoints - manage automatic post scheduling.
 from typing import List, Optional
 from uuid import UUID
 from datetime import datetime, timedelta
-import asyncio
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status, Header, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +19,6 @@ from app.models.schedule import ScheduleConfig, ScheduleInterval
 from app.models.agent import Agent
 from app.models.user import User
 from app.api.deps import get_current_user
-from app.config import settings
 from app.schemas.schedule import (
     ScheduleCreate,
     ScheduleUpdate,
@@ -29,8 +27,6 @@ from app.schemas.schedule import (
     ScheduleRunResponse,
     ScheduleStats,
 )
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/schedules", tags=["Schedules"])
 
@@ -344,12 +340,11 @@ async def delete_schedule(
 @router.post("/{schedule_id}/run", response_model=ScheduleRunResponse)
 async def run_schedule_now(
     schedule_id: UUID,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Manually trigger a schedule to run now."""
-    from app.tasks.auto_publish_tasks import auto_generate_and_publish
-
     result = await db.execute(
         select(ScheduleConfig).where(ScheduleConfig.id == schedule_id)
     )
@@ -374,19 +369,22 @@ async def run_schedule_now(
             detail="Access denied",
         )
 
-    # Trigger async task
+    # Trigger async task in background
     try:
-        task = auto_generate_and_publish.delay(str(schedule_id))
+        background_tasks.add_task(
+            run_auto_publish_for_schedule,
+            str(schedule_id)
+        )
 
         return ScheduleRunResponse(
             success=True,
-            message="Task queued successfully",
-            task_id=task.id,
+            message="Task started in background",
+            task_id=str(schedule_id),  # Use schedule_id as reference
         )
     except Exception as e:
         return ScheduleRunResponse(
             success=False,
-            message=f"Failed to queue task: {str(e)}",
+            message=f"Failed to start task: {str(e)}",
         )
 
 
@@ -442,17 +440,19 @@ async def toggle_schedule(
 async def run_auto_publish_for_schedule(schedule_id: str):
     """
     Run auto-publish workflow for a single schedule.
-    This runs the same logic as the Celery task but synchronously.
+    Uses async workflow that doesn't require Celery worker.
     """
-    from app.tasks.auto_publish_tasks import auto_generate_and_publish
+    from app.tasks.auto_publish_tasks import run_auto_publish_workflow
+    from app.database import AsyncSessionLocal
 
     try:
-        # Run the task synchronously (it uses asyncio.run internally)
-        result = auto_generate_and_publish(schedule_id)
-        logger.info(f"Auto-publish completed for schedule {schedule_id}: {result}")
-        return result
+        # Create a new database session for this background task
+        async with AsyncSessionLocal() as db:
+            result = await run_auto_publish_workflow(schedule_id, db)
+            logger.info(f"Auto-publish completed for schedule {schedule_id}: {result}")
+            return result
     except Exception as e:
-        logger.error(f"Auto-publish failed for schedule {schedule_id}: {e}")
+        logger.error(f"Auto-publish failed for schedule {schedule_id}: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 
