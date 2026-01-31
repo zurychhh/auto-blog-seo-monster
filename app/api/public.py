@@ -14,8 +14,10 @@ from app.database import get_db
 from app.models.post import Post
 from app.models.tenant import Tenant
 from app.models.user import User
+from app.models.agent import Agent
 from app.schemas.post import PostResponse, PostListResponse
 from app.config import settings
+from app.services.auth_service import AuthService
 
 logger = logging.getLogger(__name__)
 
@@ -166,4 +168,113 @@ async def fix_admin_user(
         "tenant_id": str(tenant.id),
         "old_tenant_id": str(old_tenant_id) if old_tenant_id else None,
         "old_role": old_role
+    }
+
+
+@router.post("/setup/seed-oleksiak")
+async def seed_oleksiak_tenant(
+    x_setup_key: str = Header(..., alias="X-Setup-Key"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    One-time setup: create Oleksiak Consulting tenant, agent, and superadmin user.
+    Requires X-Setup-Key header matching JWT_SECRET.
+    """
+    if x_setup_key != settings.JWT_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid setup key"
+        )
+
+    # Check if tenant already exists
+    result = await db.execute(
+        select(Tenant).where(Tenant.slug == "oleksiak-consulting")
+    )
+    existing_tenant = result.scalar_one_or_none()
+
+    if existing_tenant:
+        # Tenant exists — just return info
+        result = await db.execute(
+            select(Agent).where(Agent.tenant_id == existing_tenant.id)
+        )
+        agent = result.scalar_one_or_none()
+        result = await db.execute(
+            select(User).where(User.email == "rafal@oleksiakconsulting.com")
+        )
+        user = result.scalar_one_or_none()
+        return {
+            "status": "already_exists",
+            "tenant_id": str(existing_tenant.id),
+            "agent_id": str(agent.id) if agent else None,
+            "user_email": user.email if user else None,
+            "user_role": user.role if user else None,
+        }
+
+    # 1. Create tenant
+    tenant = Tenant(
+        name="Oleksiak Consulting",
+        slug="oleksiak-consulting",
+        is_active=True,
+        tokens_limit=500000,
+        posts_limit=200,
+    )
+    db.add(tenant)
+    await db.flush()
+
+    # 2. Create agent
+    agent = Agent(
+        tenant_id=tenant.id,
+        name="Oleksiak Blog Agent",
+        expertise="ecommerce-marketing",
+        persona=(
+            "You are a senior ecommerce and marketing consultant writing for "
+            "Oleksiak Consulting blog. You write in English about ecommerce strategy, "
+            "conversion optimization, CRM, marketing automation, and digital growth. "
+            "Your tone is professional yet accessible, backed by data and real examples."
+        ),
+        tone="professional",
+        post_length="long",
+        workflow="draft",
+        is_active=True,
+        settings={
+            "target_audience": "ecommerce managers, marketing directors, business owners",
+            "topics": ["ecommerce", "CRM", "conversion optimization", "marketing automation",
+                       "digital strategy", "growth hacking", "analytics"],
+        },
+    )
+    db.add(agent)
+    await db.flush()
+
+    # 3. Create superadmin user
+    password_hash = AuthService.hash_password("OleksiakAdmin2025!")
+    user = User(
+        tenant_id=None,  # superadmin has no tenant
+        email="rafal@oleksiakconsulting.com",
+        password_hash=password_hash,
+        role="superadmin",
+        is_active=True,
+    )
+    db.add(user)
+
+    # 4. Also promote existing admin@legitio.pl to superadmin
+    result = await db.execute(
+        select(User).where(User.email == "admin@legitio.pl")
+    )
+    legitio_admin = result.scalar_one_or_none()
+    if legitio_admin:
+        legitio_admin.role = "superadmin"
+        legitio_admin.tenant_id = None
+
+    await db.commit()
+
+    return {
+        "status": "success",
+        "message": "Oleksiak Consulting tenant seeded",
+        "tenant_id": str(tenant.id),
+        "tenant_slug": tenant.slug,
+        "agent_id": str(agent.id),
+        "agent_name": agent.name,
+        "user_email": user.email,
+        "user_role": user.role,
+        "legitio_admin_promoted": legitio_admin is not None,
     }
