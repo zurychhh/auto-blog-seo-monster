@@ -12,7 +12,7 @@ from app.config import settings
 from app.database import init_db, close_db
 
 # Import routers
-from app.api import auth, tenants, agents, sources, publishers, posts, tasks, public, schedules
+from app.api import auth, tenants, agents, sources, publishers, posts, tasks, public, schedules, topics
 
 # Configure logging
 logging.basicConfig(
@@ -158,6 +158,7 @@ app.include_router(publishers.tenant_router, prefix=settings.API_PREFIX)  # Tena
 app.include_router(posts.router, prefix=settings.API_PREFIX)
 app.include_router(tasks.router, prefix=settings.API_PREFIX)
 app.include_router(schedules.router, prefix=settings.API_PREFIX)
+app.include_router(topics.router, prefix=settings.API_PREFIX)
 
 
 if __name__ == "__main__":
